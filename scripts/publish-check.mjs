@@ -52,7 +52,7 @@ function checkRepository() {
   ['build', 'start', 'lint'].every((s) => pkg.scripts?.[s])
     ? pass(G, 'npm scripts build/start/lint defined')
     : fail(G, 'npm scripts build/start/lint defined');
-  pkg.engines?.node ? pass(G, 'Node engine pinned', pkg.engines.node) : warn(G, 'Node engine pinned', 'add "engines": { "node": ">=20" }');
+  pkg.engines?.node ? pass(G, 'Node engine pinned', pkg.engines.node) : warn(G, 'Node engine pinned', 'add "engines": { "node": ">=22.19" }');
 
   const readme = fs.existsSync(path.join(ROOT, 'README.md')) ? fs.readFileSync(path.join(ROOT, 'README.md'), 'utf8') : '';
   /medical disclaimer/i.test(readme) ? pass(G, 'Medical disclaimer in README') : fail(G, 'Medical disclaimer in README', 'educational medical apps must carry a disclaimer');

@@ -31,7 +31,7 @@ The same gate runs in CI (`.github/workflows/ci.yml`). At runtime, `GET /api/rea
 - Dev command: `npm run dev`
 
 ## 4) Required Tools
-- Node.js 20.x LTS (or newer)
+- Node.js 22.19+ (Node 20 is end-of-life and cannot load the bundled `undici`)
 - npm 10+
 - Git
 - Optional for container deploy:

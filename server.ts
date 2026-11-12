@@ -3,17 +3,27 @@ import path from "path";
 import fs from "fs";
 import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from "dotenv";
-import { setGlobalDispatcher, EnvHttpProxyAgent } from "undici";
 import { getFallbackMindmap, getFallbackCases } from "./fallbackGenerator";
 import { getFallbackMap } from "./src/data/fallbackMaps";
 
 dotenv.config({ path: ".env.local" });
 dotenv.config({ path: ".env" });
 
-// Node's built-in fetch ignores HTTPS_PROXY. Behind a corporate or egress proxy every
-// provider call would fail with ENOTFOUND, so route fetch through the proxy when one is set.
-if (process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy) {
-  setGlobalDispatcher(new EnvHttpProxyAgent());
+/**
+ * Node's built-in fetch ignores HTTPS_PROXY. Behind a corporate or egress proxy every
+ * provider call would fail with ENOTFOUND, so route fetch through the proxy when one is set.
+ * undici is loaded lazily and only when needed, and a failure to load it never stops the server.
+ */
+async function configureOutboundProxy(): Promise<void> {
+  const proxy = process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy;
+  if (!proxy) return;
+  try {
+    const { setGlobalDispatcher, EnvHttpProxyAgent } = await import("undici");
+    setGlobalDispatcher(new EnvHttpProxyAgent());
+    console.log(JSON.stringify({ level: "info", msg: "outbound_proxy_enabled" }));
+  } catch (err: any) {
+    console.warn(JSON.stringify({ level: "warn", msg: "outbound_proxy_unavailable", error: String(err?.message || err).slice(0, 200) }));
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -705,8 +715,9 @@ function buildReadinessReport() {
   const checks: ReadinessCheck[] = [];
   const add = (id: string, label: string, status: CheckStatus, detail: string) => checks.push({ id, label, status, detail });
 
-  const nodeMajor = Number(process.versions.node.split(".")[0]);
-  add("runtime.node", "Node.js 20 or newer", nodeMajor >= 20 ? "pass" : "fail", `Running ${process.versions.node}`);
+  const [nodeMajor, nodeMinor] = process.versions.node.split(".").map(Number);
+  const nodeOk = nodeMajor > 22 || (nodeMajor === 22 && nodeMinor >= 19);
+  add("runtime.node", "Node.js 22.19 or newer", nodeOk ? "pass" : "fail", `Running ${process.versions.node}`);
   add("runtime.env", "NODE_ENV=production", IS_PROD ? "pass" : "warn", IS_PROD ? "Production mode" : `NODE_ENV=${process.env.NODE_ENV || "(unset)"}: dev server and HMR active`);
 
   if (IS_PROD) {
@@ -2710,6 +2721,7 @@ app.use((err: any, req: Request, res: Response, _next: NextFunction) => {
 
 // Serve static assets in production, hook Vite dev server in development
 async function startServer() {
+  await configureOutboundProxy();
   if (!IS_PROD) {
     const { createServer } = await import("vite");
     const vite = await createServer({
