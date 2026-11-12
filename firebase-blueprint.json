@@ -1,0 +1,22 @@
+{
+  "entities": {
+    "MindMap": {
+      "title": "MindMap",
+      "description": "A medical mind map",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "topic": { "type": "string" },
+        "data": { "type": "object" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "topic", "data", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/mindmaps/{mapId}": {
+      "schema": "MindMap",
+      "description": "User's mind maps"
+    }
+  }
+}

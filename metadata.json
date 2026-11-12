@@ -1,0 +1,6 @@
+{
+  "name": "MedMap Visual Atlas",
+  "description": "An interactive medical mapping visual atlas for anatomical structures, physiological pathways, drug interactions, and symptom diagnosis with clinical case simulators.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

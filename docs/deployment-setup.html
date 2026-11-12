@@ -1,0 +1,280 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Final Deployment Setup - MedMap Visual Atlas</title>
+    <style>
+        :root {
+            --bg: #f4f0e8;
+            --surface: #fffdf8;
+            --ink: #1d2a2f;
+            --muted: #5d6d74;
+            --accent: #0c6f67;
+            --accent2: #bb5a2b;
+            --line: #d8d0c3;
+            --code-bg: #1f2735;
+            --code-ink: #eef3ff;
+            --ok: #218c5f;
+            --warn: #9b6500;
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            font-family: "Segoe UI", Tahoma, sans-serif;
+            color: var(--ink);
+            background:
+                radial-gradient(circle at 10% 0%, #f8edd9 0%, transparent 28%),
+                radial-gradient(circle at 100% 10%, #dfeeea 0%, transparent 35%),
+                var(--bg);
+            line-height: 1.55;
+        }
+
+        .wrap {
+            max-width: 1120px;
+            margin: 0 auto;
+            padding: 26px 16px 60px;
+            animation: fadeIn 0.45s ease-out;
+        }
+
+        .hero {
+            background: linear-gradient(130deg, #0c6f67, #0f4d6a);
+            color: white;
+            border-radius: 16px;
+            padding: 22px;
+            box-shadow: 0 14px 35px rgba(12, 52, 72, 0.3);
+        }
+
+        h1 {
+            margin: 0 0 8px;
+            font-size: clamp(1.5rem, 2.8vw, 2.2rem);
+            letter-spacing: 0.2px;
+        }
+
+        .sub {
+            margin: 0;
+            color: #d7f0ef;
+            max-width: 80ch;
+        }
+
+        .badge {
+            display: inline-block;
+            margin-right: 8px;
+            margin-top: 10px;
+            padding: 4px 10px;
+            border-radius: 999px;
+            border: 1px solid rgba(255, 255, 255, 0.35);
+            font-size: 0.84rem;
+            color: #e8fffb;
+            background: rgba(255, 255, 255, 0.08);
+        }
+
+        .grid {
+            margin-top: 14px;
+            display: grid;
+            grid-template-columns: repeat(12, 1fr);
+            gap: 14px;
+        }
+
+        .card {
+            grid-column: span 12;
+            border: 1px solid var(--line);
+            background: var(--surface);
+            border-radius: 12px;
+            padding: 16px;
+            box-shadow: 0 6px 16px rgba(0, 0, 0, 0.06);
+        }
+
+        @media (min-width: 920px) {
+            .half {
+                grid-column: span 6;
+            }
+        }
+
+        h2 {
+            margin: 0 0 10px;
+            font-size: 1.1rem;
+            color: var(--accent);
+            border-left: 4px solid var(--accent2);
+            padding-left: 10px;
+        }
+
+        ul,
+        ol {
+            margin: 8px 0 0 20px;
+        }
+
+        li {
+            margin: 4px 0;
+        }
+
+        code {
+            background: #f0ece2;
+            border: 1px solid #ddd6c8;
+            border-radius: 6px;
+            padding: 1px 6px;
+            font-family: Consolas, monospace;
+        }
+
+        pre {
+            margin: 10px 0 0;
+            background: var(--code-bg);
+            color: var(--code-ink);
+            border-radius: 10px;
+            border: 1px solid #3c495f;
+            padding: 12px;
+            overflow: auto;
+            font-size: 0.86rem;
+            line-height: 1.45;
+            white-space: pre-wrap;
+        }
+
+        .ok {
+            margin-top: 10px;
+            padding: 10px;
+            border-left: 4px solid var(--ok);
+            background: #edf9f2;
+            border-radius: 8px;
+        }
+
+        .warn {
+            margin-top: 10px;
+            padding: 10px;
+            border-left: 4px solid var(--warn);
+            background: #fff5e8;
+            border-radius: 8px;
+        }
+
+        .footer {
+            margin-top: 18px;
+            color: var(--muted);
+            text-align: center;
+            font-size: 0.92rem;
+        }
+
+        @keyframes fadeIn {
+            from {
+                opacity: 0;
+                transform: translateY(6px);
+            }
+
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+    </style>
+</head>
+
+<body>
+    <main class="wrap">
+        <section class="hero">
+            <h1>Final Deployment Setup - MedMap Visual Atlas</h1>
+            <p class="sub">Complete, deployment-ready build and runtime setup for this project, including
+                OpenAI-compatible provider configuration, production run commands, and release checklist.</p>
+            <span class="badge">Build Verified</span>
+            <span class="badge">Runtime Verified</span>
+            <span class="badge">Publish Gate: npm run check:publish</span>
+        </section>
+
+        <section class="grid">
+            <article class="card half">
+                <h2>1) Environment Template</h2>
+                <pre>PORT=3000
+NODE_ENV=production
+APP_URL=https://your-domain.example
+
+TRUST_PROXY=1
+
+GEMINI_API_KEY=
+GEMINI_BASE_URL=
+GEMINI_MODEL=gemini-2.5-flash</pre>
+                <div class="warn">Never commit secrets. Use a secret manager in production.</div>
+            </article>
+
+            <article class="card half">
+                <h2>2) Core Commands</h2>
+                <pre>npm ci
+npm run verify   # typecheck + build + publish check
+npm start</pre>
+                <pre>Invoke-RestMethod -Uri "http://localhost:3000/api/status" -Method GET | ConvertTo-Json -Depth 5</pre>
+                <div class="ok">Pass if endpoint returns JSON with configured/source fields.</div>
+            </article>
+
+            <article class="card">
+                <h2>3) Functional API Smoke Test</h2>
+                <pre>$body = @{ symptoms = @('chest pain','shortness of breath') } | ConvertTo-Json
+Invoke-RestMethod -Uri "http://localhost:3000/api/analyze-symptoms" -Method POST -ContentType "application/json" -Body $body | ConvertTo-Json -Depth 8</pre>
+                <ul>
+                    <li>Expected: HTTP 200</li>
+                    <li>Expected: response contains <code>data.differentials</code></li>
+                    <li>Expected: non-empty medical differential output</li>
+                </ul>
+            </article>
+
+            <article class="card half">
+                <h2>4) Docker Production</h2>
+                <pre>docker build -t medmap:prod .
+docker run --name medmap -p 3000:3000 --env-file .env medmap:prod
+curl http://localhost:3000/api/status</pre>
+            </article>
+
+            <article class="card half">
+                <h2>5) VM/Server Production</h2>
+                <pre>npm ci
+npm run verify
+npm prune --omit=dev
+NODE_ENV=production pm2 start dist/server.cjs --name medmap
+pm2 save</pre>
+            </article>
+
+            <article class="card">
+                <h2>6) Reverse Proxy (Nginx)</h2>
+                <pre>server {
+  listen 80;
+  server_name your-domain.example;
+
+  client_max_body_size 1m;
+
+  location / {
+    proxy_pass http://127.0.0.1:3000;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+  }
+}</pre>
+            </article>
+
+            <article class="card half">
+                <h2>7) Release Checklist</h2>
+                <pre>[ ] npm run check:publish → READY TO PUBLISH
+[ ] /api/readiness returns 200
+[ ] HTTPS enabled
+[ ] Logs and alerts enabled
+[ ] Rollback artifact ready</pre>
+            </article>
+
+            <article class="card half">
+                <h2>8) Hardening Status</h2>
+                <pre>[x] /api/health and /api/readiness
+[x] Rate limiting (RATE_LIMIT_PER_MIN)
+[x] 100 KB body-size limit
+[x] JSON access logs with latency
+[x] Frontend code splitting
+[ ] Shared rate limit/cache store for multi-replica
+[ ] Review npm audit findings each release</pre>
+            </article>
+        </section>
+
+        <p class="footer">This final HTML guide pairs with FINAL_DEPLOYMENT_SETUP.md.</p>
+    </main>
+</body>
+
+</html>
