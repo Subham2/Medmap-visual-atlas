@@ -184,6 +184,7 @@ async function checkRuntime() {
   const port = await freePort();
   const base = `http://127.0.0.1:${port}`;
   const env = { ...process.env, NODE_ENV: 'production', PORT: String(port), RATE_LIMIT_PER_MIN: '25' };
+  if (LIVE) env.AI_TIMEOUT_MS = env.AI_TIMEOUT_MS || '110000';
   if (!LIVE) Object.assign(env, { GEMINI_API_KEY: '', GEMINI_BASE_URL: '', AI_BACKUP_API_KEY: '' });
 
   const child = spawn(process.execPath, ['dist/server.cjs'], { cwd: ROOT, env, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -230,6 +231,18 @@ async function checkRuntime() {
           r = await request(base, method, url, body);
         }
         const src = r.json?.source ? ` · source=${r.json.source}` : '';
+        // In --live mode an AI route that silently fell back to offline data is a failure, not a pass.
+        // Images may legitimately fall back when no candidate survives URL verification.
+        const aiRoute = method === 'POST' && r.status === 200 && typeof r.json?.source === 'string' && !url.includes('sync-to-sheets');
+        // Image retrieval also depends on Wikimedia, which can throttle shared IPs: degrade to a warning.
+        if (LIVE && url === '/api/medical-images' && r.json.source !== 'gemini') {
+          warn(G, name, `served curated images (source=${r.json.source}); check Wikimedia reachability from the host`);
+          continue;
+        }
+        if (LIVE && aiRoute && r.json.source !== 'gemini') {
+          fail(G, name, `expected live AI response, got source=${r.json.source} after ${r.ms} ms`);
+          continue;
+        }
         assert(r) ? pass(G, name, `${r.status} in ${r.ms} ms${src}`) : fail(G, name, `unexpected response ${r.status}: ${r.text.slice(0, 160)}`);
       } catch (err) {
         fail(G, name, err.message);

@@ -3,11 +3,18 @@ import path from "path";
 import fs from "fs";
 import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from "dotenv";
+import { setGlobalDispatcher, EnvHttpProxyAgent } from "undici";
 import { getFallbackMindmap, getFallbackCases } from "./fallbackGenerator";
 import { getFallbackMap } from "./src/data/fallbackMaps";
 
 dotenv.config({ path: ".env.local" });
 dotenv.config({ path: ".env" });
+
+// Node's built-in fetch ignores HTTPS_PROXY. Behind a corporate or egress proxy every
+// provider call would fail with ENOTFOUND, so route fetch through the proxy when one is set.
+if (process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy) {
+  setGlobalDispatcher(new EnvHttpProxyAgent());
+}
 
 // ---------------------------------------------------------------------------
 // Runtime configuration (all tunable through environment variables)
@@ -21,6 +28,37 @@ const AI_CACHE_MAX_ENTRIES = Number(process.env.AI_CACHE_MAX_ENTRIES) || 200;
 const RATE_LIMIT_PER_MIN = Number(process.env.RATE_LIMIT_PER_MIN) || 30;
 const MAX_TOPIC_LEN = 200;
 const DEFAULT_CUSTOM_MODEL = "gemini-3.5-flash";
+// Many gateways cut a request at ~30 s. Each attempt gets its own budget so a slow model
+// still leaves time to fail over to the next one within AI_TIMEOUT_MS.
+const AI_ATTEMPT_TIMEOUT_MS = Number(process.env.AI_ATTEMPT_TIMEOUT_MS) || 28_000;
+// Provider-side concurrency caps (aicredits.in allows ~5 per key) turn bursts into 429s.
+// A process-wide semaphore queues calls instead; the per-call deadline starts once a slot is held.
+const AI_MAX_CONCURRENCY = Math.max(1, Number(process.env.AI_MAX_CONCURRENCY) || 4);
+let aiActive = 0;
+const aiWaiters: Array<() => void> = [];
+async function acquireAISlot(): Promise<void> {
+  if (aiActive < AI_MAX_CONCURRENCY) {
+    aiActive++;
+    return;
+  }
+  await new Promise<void>((resolve) => aiWaiters.push(resolve));
+}
+function releaseAISlot() {
+  const next = aiWaiters.shift();
+  if (next) next(); // hand the slot over directly; aiActive is unchanged
+  else aiActive--;
+}
+async function withAISlot<T>(fn: () => Promise<T>): Promise<T> {
+  await acquireAISlot();
+  try {
+    return await fn();
+  } finally {
+    releaseAISlot();
+  }
+}
+
+const AI_FALLBACK_MODELS = (process.env.AI_FALLBACK_MODELS || "gpt-4o-mini")
+  .split(",").map((m) => m.trim()).filter(Boolean);
 
 const app = express();
 app.disable("x-powered-by");
@@ -205,7 +243,11 @@ class ProviderHttpError extends Error {
   }
 }
 
-async function callCustomOpenAI(params: any, apiKey: string, baseUrl: string): Promise<{ text: string }> {
+function callCustomOpenAI(params: any, apiKey: string, baseUrl: string): Promise<{ text: string }> {
+  return withAISlot(() => callCustomOpenAIUnqueued(params, apiKey, baseUrl));
+}
+
+async function callCustomOpenAIUnqueued(params: any, apiKey: string, baseUrl: string): Promise<{ text: string }> {
   let promptText = contentsToText(params.contents);
   const responseMimeType = params.config?.responseMimeType || params.generationConfig?.responseMimeType;
   if (responseMimeType === "application/json" && !promptText.toLowerCase().includes("json")) {
@@ -216,11 +258,9 @@ async function callCustomOpenAI(params: any, apiKey: string, baseUrl: string): P
   // Configured model first, then a short list of known-good fallbacks on the same endpoint.
   const configured = cleanEnv(process.env.GEMINI_MODEL);
   const candidates = [
-    configured && isValidModelName(configured) ? configured : null,
-    params.model && isValidModelName(params.model) && !/^gemini-2\.5/.test(params.model) ? params.model : null,
-    DEFAULT_CUSTOM_MODEL,
-    "gpt-4o-mini",
-  ].filter(Boolean) as string[];
+    configured && isValidModelName(configured) ? configured : DEFAULT_CUSTOM_MODEL,
+    ...AI_FALLBACK_MODELS,
+  ].filter((m) => isValidModelName(m)) as string[];
   const modelsToTry = Array.from(new Set(candidates)).slice(0, 3);
 
   const cleanBaseUrl = baseUrl.replace(/\/$/, "");
@@ -233,12 +273,14 @@ async function callCustomOpenAI(params: any, apiKey: string, baseUrl: string): P
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(remaining),
+      signal: AbortSignal.timeout(Math.min(remaining, AI_ATTEMPT_TIMEOUT_MS)),
     });
   };
 
   let lastError: any = null;
-  for (const model of modelsToTry) {
+  let rateLimitRetries = 0;
+  for (let mi = 0; mi < modelsToTry.length; mi++) {
+    const model = modelsToTry[mi];
     try {
       const body: any = { model, messages };
       if (responseMimeType === "application/json") body.response_format = { type: "json_object" };
@@ -257,6 +299,13 @@ async function callCustomOpenAI(params: any, apiKey: string, baseUrl: string): P
       return asGenAIResponse(content);
     } catch (err: any) {
       lastError = err;
+      // Rate/concurrency limit: back off and retry the SAME model (another model would hit the same cap).
+      if (err instanceof ProviderHttpError && err.status === 429 && rateLimitRetries < 3 && Date.now() + 3000 < deadline) {
+        rateLimitRetries++;
+        await new Promise((r) => setTimeout(r, 1000 * rateLimitRetries + Math.random() * 1000));
+        mi--;
+        continue;
+      }
       // Bad credentials or exhausted credit will fail identically on every model: stop early.
       if (err instanceof ProviderHttpError && [401, 402, 403].includes(err.status)) break;
       if (Date.now() >= deadline) break;
@@ -296,7 +345,16 @@ function cleanAndParseJSON(text: string): any {
     cleanText = cleanText.substring(startIdx, endIdx + 1);
   }
 
-  return JSON.parse(cleanText);
+  try {
+    return JSON.parse(cleanText);
+  } catch (err) {
+    // Repair the two most common model JSON defects, then retry once:
+    // invalid escapes (LaTeX "\(", "\alpha", "\%") and raw control characters inside strings.
+    const repaired = cleanText
+      .replace(/\\(?!["\\/bfnrtu])/g, "\\\\")
+      .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, " ");
+    return JSON.parse(repaired);
+  }
 }
 
 /**
@@ -400,7 +458,7 @@ async function callGeminiWithRetry(ai: GoogleGenAI, params: any, retries = 1, de
     let lastError: any = null;
     for (let attempt = 0; attempt <= retries; attempt++) {
       try {
-        return await withTimeout(ai.models.generateContent(normalizedParams), AI_TIMEOUT_MS, "Gemini request");
+        return await withAISlot(() => withTimeout(ai.models.generateContent(normalizedParams), AI_TIMEOUT_MS, "Gemini request"));
       } catch (error: any) {
         lastError = error;
         const message = String(error?.message || error);
@@ -430,6 +488,39 @@ async function callGeminiWithRetry(ai: GoogleGenAI, params: any, retries = 1, de
     return value;
   } finally {
     pendingRequests.delete(cacheKey);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Chunked generation. Large documents (10 cases, 21-section mind maps, 14-section
+// mechanism maps) cannot be produced in one call under a ~30 s gateway limit, so they
+// are split into independent chunks generated concurrently and merged. Partial
+// success degrades gracefully: missing chunks are filled from offline data.
+// ---------------------------------------------------------------------------
+async function generateJSON(ai: GoogleGenAI, prompt: string): Promise<any> {
+  const response = await callGeminiWithRetry(ai, {
+    model: "gemini-2.5-flash",
+    contents: prompt,
+    config: { responseMimeType: "application/json" },
+  });
+  const parsed = cleanAndParseJSON(response.text || "");
+  if (parsed === null || typeof parsed !== "object") throw new Error("Model returned no JSON object");
+  return parsed;
+}
+
+async function generateText(ai: GoogleGenAI, prompt: string): Promise<string> {
+  const response = await callGeminiWithRetry(ai, { model: "gemini-2.5-flash", contents: prompt });
+  const text = String(response.text || "").trim().replace(/^```(?:markdown|md)?\s*/i, "").replace(/\s*```$/, "");
+  if (!text) throw new Error("Model returned empty text");
+  return text;
+}
+
+function logChunkFailures(route: string, results: PromiseSettledResult<unknown>[]) {
+  const failed = results
+    .map((r, i) => (r.status === "rejected" ? `${i}:${String((r as PromiseRejectedResult).reason?.message || r.reason).slice(0, 80)}` : null))
+    .filter(Boolean);
+  if (failed.length) {
+    console.warn(JSON.stringify({ level: "warn", msg: "chunk_failures", route, failed: failed.length, total: results.length, detail: failed }));
   }
 }
 
@@ -764,15 +855,12 @@ function getFallbackImagesForTopic(topic: string): any[] {
     return FALLBACK_IMAGES["cirrhosis"];
   }
   
-  // Return high-quality subset as default fallback list
-  return [
-    ...FALLBACK_IMAGES["myocardial infarction"],
-    ...FALLBACK_IMAGES["pneumonia"],
-    ...FALLBACK_IMAGES["stroke"],
-    ...FALLBACK_IMAGES["appendicitis"],
-    ...FALLBACK_IMAGES["cirrhosis"]
-  ].slice(0, 3);
+  // No curated match: return nothing rather than images of unrelated diseases labelled "verified".
+  return [];
 }
+
+// Wikimedia's API policy requires an identifying User-Agent; spoofed browser UAs get throttled (HTTP 429).
+const MEDMAP_USER_AGENT = "MedMapVisualAtlas/1.2 (medical education app)";
 
 async function checkUrlLive(url: string, isImage: boolean = false): Promise<{ ok: boolean; contentType?: string; status?: number }> {
   const controller = new AbortController();
@@ -781,7 +869,7 @@ async function checkUrlLive(url: string, isImage: boolean = false): Promise<{ ok
     // Try HEAD first
     let response = await fetch(url, {
       method: 'HEAD',
-      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/119.0' },
+      headers: { 'User-Agent': MEDMAP_USER_AGENT },
       signal: controller.signal
     });
 
@@ -792,7 +880,7 @@ async function checkUrlLive(url: string, isImage: boolean = false): Promise<{ ok
       const getTimeoutId = setTimeout(() => getController.abort(), 6000);
       
       const headers: Record<string, string> = { 
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/119.0' 
+        'User-Agent': MEDMAP_USER_AGENT 
       };
       if (isImage) {
         // GET with range to avoid downloading the entire large image
@@ -838,7 +926,7 @@ async function checkUrlLive(url: string, isImage: boolean = false): Promise<{ ok
   }
 }
 
-async function verifyMedicalImageAsync(img: any): Promise<{ verified: boolean; score: number; status: "verified" | "needs_review" | "rejected"; metadata?: any }> {
+async function verifyMedicalImageAsync(img: any, opts: { trustedCommonsMetadata?: boolean } = {}): Promise<{ verified: boolean; score: number; status: "verified" | "needs_review" | "rejected"; metadata?: any }> {
   if (!img || typeof img !== "object") {
     return { verified: false, score: 0, status: "rejected" };
   }
@@ -981,7 +1069,7 @@ async function verifyMedicalImageAsync(img: any): Promise<{ verified: boolean; s
 
   // 3e. Wikimedia specific verification
   const isWikimedia = originalSourcePage.includes("wikimedia.org") || imageUrl.includes("wikimedia.org");
-  if (isWikimedia) {
+  if (isWikimedia && !opts.trustedCommonsMetadata) {
     try {
       // Extract filename
       let filename = "";
@@ -1107,7 +1195,7 @@ app.post("/api/medical-images", async (req, res) => {
   }
 
   const fallback = getFallbackImagesForTopic(topic);
-  res.setTimeout(20000, () => {
+  res.setTimeout(45000, () => {
     if (!res.headersSent) {
       res.json({ source: "fallback-timeout", data: fallback });
     }
@@ -1119,80 +1207,127 @@ app.post("/api/medical-images", async (req, res) => {
   }
 
   try {
-    // ... [Prompt omitted for brevity, but I should restore it if possible] ...
-    // Actually I can reconstruct it.
-    const systemPrompt = `You are an expert clinical medical educator and academic media researcher.
-Search the web to find real, authentic, source-linked medical images for the topic: "${topic}".
-Return structured educational image metadata only.
+    // 1. Retrieve REAL files from Wikimedia Commons (LLMs invent plausible but non-existent file URLs).
+    const candidates = await searchCommonsImages(topic);
+    if (candidates.length === 0) return res.json({ source: "fallback-none-found", data: fallback });
 
-You MUST find and extract details for 2 to 4 real, credible medical images representing this topic.
-Every URL must be a real, live, open-source or openly-reusable URL of an image file from verified sources (e.g., Wikimedia Commons, CDC Public Health Image Library (PHIL), NIH/NLM resources, NCI Visuals Online, PubMed Central open-access figures, MedPix). Do NOT generate AI images or fabricate URLs.
+    // 2. The model only judges relevance and writes teaching notes for files that verifiably exist.
+    const listing = candidates
+      .map((c, i) => `${i}. ${c.imageTitle} | ${c.description.slice(0, 240)}`)
+      .join("\n");
+    const annotated = await generateJSON(ai, `You are an expert clinical medical educator selecting open-licence teaching images for: "${topic}".
+Candidate Wikimedia Commons files (index. title | description):
+${listing}
 
-The search categories can be: "clinical image", "histopathology slide", "gross pathology specimen", "tissue section", "radiology image", "anatomy diagram", "pathophysiology diagram".
+Select the 2 to 4 candidates that are genuinely medically relevant to "${topic}" (clinical photos, radiology, histopathology, gross pathology, anatomy or pathophysiology diagrams). Exclude portraits, logos, maps, statistics charts and anything off-topic. If none are relevant, return an empty list.
+Return JSON {"images":[{"index": number, "imageCategory": one of "clinical image" | "histopathology slide" | "gross pathology specimen" | "radiology image" | "anatomy diagram" | "pathophysiology diagram", "teachingPoints": "2-3 sentences on what the image shows", "clinicalPathologyCorrelation": "2 sentences linking the visual findings to the mechanism"}]}`);
 
-For each image, include:
-- originalSourcePage: URL of the web page containing the image (e.g., the Wikimedia Commons File page, or PubMed Central article PMC page).
-- imageTitle: title or descriptive name of the image.
-- imageCategory: one of: "clinical image", "histopathology slide", "gross pathology specimen", "tissue section", "radiology image", "anatomy diagram", "pathophysiology diagram".
-- imageUrl: direct URL of the image file (must be a real, live, direct image file URL from Wikimedia Commons [upload.wikimedia.org], CDC, or NIH).
-- sourceName: name of the source (e.g., "Wikimedia Commons", "CDC PHIL", "PubMed Central", "MedPix").
-- authorInstitution: creator, author, or institution.
-- license: the specific open-access license (e.g., "CC BY-SA 3.0", "CC BY 4.0", "CC0", "Public Domain").
-- licenseUrl: the URL for the license terms.
-- attributionText: proper attribution string.
-- teachingPoints: clinical pearls or teaching points about what is shown in the image (2-3 sentences).
-- clinicalPathologyCorrelation: detailed correlation linking the visual findings to the molecular/cellular pathophysiology or clinical presentation.
-- verificationStatus: set to "verified" if from a verified clinical source.
+    const picks = (extractArray(annotated, ["images"]) || [])
+      .filter((p: any) => Number.isInteger(p?.index) && candidates[p.index])
+      .slice(0, 4);
+    if (picks.length === 0) return res.json({ source: "fallback-none-relevant", data: fallback });
 
-Reject all AI-generated images, unsourced images, social media reposts, stock photos, copyrighted textbook scans, paywalled atlas images, or identifiable patient images without clear consent.
-
-Return ONLY valid JSON of the form {"images": [ ...image objects... ]}, without any markdown formatting wrappers or backticks.`;
-
-    const response = await callGeminiWithRetry(ai, {
-      model: "gemini-2.5-flash",
-      contents: systemPrompt,
-      config: {
-        responseMimeType: "application/json",
-      }
-    });
-
-    // JSON-object mode returns {"images":[...]}, not a bare array.
-    const parsed = cleanAndParseJSON(response.text || "[]");
-    const rawList = (extractArray(parsed, ["images", "data", "results"]) || []).slice(0, 6);
-    
-    // Concurrently verify medical images using the upgraded async verifier with live HTTP checks
-    const verificationResults = await Promise.all(
-      rawList.map(async (img: any) => {
+    // 3. Score through the verification pipeline (licence, domain, live URL and content-type checks).
+    const verified = await Promise.all(
+      picks.map(async (p: any) => {
+        const c = candidates[p.index];
+        const img = {
+          ...c,
+          imageCategory: String(p.imageCategory || "clinical image"),
+          teachingPoints: String(p.teachingPoints || ""),
+          clinicalPathologyCorrelation: String(p.clinicalPathologyCorrelation || ""),
+          verificationStatus: "pending",
+        };
         try {
-          const result = await verifyMedicalImageAsync(img);
-          if (result.status === "rejected") {
-            return null;
-          }
-          return {
-            ...result.metadata,
-            verificationStatus: result.status,
-            verificationScore: result.score
-          };
-        } catch (e) {
-          console.warn("Error verifying image asynchronously:", e);
+          // Verify the original file (canonical upload.wikimedia.org URL); show the lighter thumbnail.
+          const result = await verifyMedicalImageAsync({ ...img, imageUrl: c.originalUrl }, { trustedCommonsMetadata: true });
+          return result.status === "rejected" ? null : { ...img, ...result.metadata, imageUrl: c.imageUrl, verificationStatus: result.status, verificationScore: result.score };
+        } catch {
           return null;
         }
-      })
+      }),
     );
-
-    // Filter out rejected null entries
-    const filteredAndReviewed = verificationResults.filter(Boolean);
-    if (filteredAndReviewed.length === 0) {
-      // Nothing survived verification: fall back to curated verified images rather than an empty atlas.
-      return res.json({ source: "fallback-none-verified", data: fallback });
-    }
-    return res.json({ source: "gemini", data: filteredAndReviewed });
+    const data = verified.filter(Boolean);
+    if (data.length === 0) return res.json({ source: "fallback-none-verified", data: fallback });
+    return res.json({ source: "gemini", data });
   } catch (error: any) {
-    const errorMsg = error?.message || String(error);
-    console.log("Gemini medical images search service failed or unavailable. Activating clinical images fallback safely:", errorMsg);
+    console.log("Medical image retrieval failed; using curated images:", error?.message || error);
     return res.json({ source: "fallback-due-to-error", data: fallback });
   }
 });
+
+/** Search Wikimedia Commons for openly licensed raster images and normalise their metadata. */
+type CommonsImage = {
+  originalSourcePage: string; imageTitle: string; imageUrl: string; originalUrl: string; sourceName: string;
+  authorInstitution: string; license: string; licenseUrl: string; attributionText: string; description: string;
+};
+const commonsCache = new Map<string, { at: number; value: CommonsImage[] }>();
+
+async function searchCommonsImages(topic: string): Promise<CommonsImage[]> {
+  const key = topic.toLowerCase();
+  const hit = commonsCache.get(key);
+  if (hit && Date.now() - hit.at < AI_CACHE_TTL_MS) return hit.value;
+  const value = await searchCommonsImagesUncached(topic);
+  commonsCache.set(key, { at: Date.now(), value });
+  if (commonsCache.size > 200) commonsCache.delete(commonsCache.keys().next().value as string);
+  return value;
+}
+
+/** Drop tracking query strings Commons now appends to file URLs. */
+const cleanUrl = (u: string) => String(u || "").split("?")[0];
+
+let commonsCooldownUntil = 0;
+
+async function searchCommonsImagesUncached(topic: string): Promise<CommonsImage[]> {
+  if (Date.now() < commonsCooldownUntil) throw new Error("Wikimedia rate-limit cooldown active");
+  const params = new URLSearchParams({
+    action: "query",
+    format: "json",
+    generator: "search",
+    gsrnamespace: "6",
+    gsrsearch: `${topic} filetype:bitmap`,
+    gsrlimit: "15",
+    prop: "imageinfo",
+    iiprop: "url|mime|extmetadata",
+    iiurlwidth: "800",
+  });
+  const r = await fetch(`https://commons.wikimedia.org/w/api.php?${params}`, {
+    headers: { "User-Agent": MEDMAP_USER_AGENT },
+    signal: AbortSignal.timeout(8000),
+  });
+  if (r.status === 429) {
+    // Respect Wikimedia's throttle: stop calling until Retry-After elapses (curated images meanwhile).
+    commonsCooldownUntil = Date.now() + (Number(r.headers.get("retry-after")) || 60) * 1000;
+  }
+  if (!r.ok) throw new Error(`Wikimedia search HTTP ${r.status}`);
+  const json: any = await r.json();
+  const strip = (h: string) => String(h || "").replace(/<[^>]*>/g, "").replace(/\s+/g, " ").trim();
+  const pages: any[] = Object.values(json?.query?.pages || {}).sort((x: any, y: any) => (x.index ?? 0) - (y.index ?? 0));
+
+  return pages
+    .map((pg) => {
+      const info = pg.imageinfo?.[0];
+      const meta = info?.extmetadata || {};
+      const license = strip(meta.LicenseShortName?.value);
+      if (!info || !/^image\/(jpeg|png|gif|webp)/.test(info.mime || "")) return null;
+      if (!/(cc|public domain|pd)/i.test(license) || /nc|nd/i.test(license.replace(/\bcc\b/i, ""))) return null;
+      const artist = strip(meta.Artist?.value) || strip(meta.Credit?.value) || "Unknown creator";
+      const title = String(pg.title || "").replace(/^File:/, "");
+      return {
+        originalSourcePage: cleanUrl(info.descriptionurl),
+        imageTitle: title.replace(/\.[a-z]+$/i, "").replace(/_/g, " "),
+        imageUrl: cleanUrl(info.thumburl || info.url),
+        originalUrl: cleanUrl(info.url),
+        sourceName: "Wikimedia Commons",
+        authorInstitution: artist.slice(0, 120),
+        license,
+        licenseUrl: (strip(meta.LicenseUrl?.value) || "https://commons.wikimedia.org/wiki/Commons:Licensing").replace(/^http:/, "https:"),
+        attributionText: `${artist.slice(0, 120)}, ${license}, via Wikimedia Commons`,
+        description: strip(meta.ImageDescription?.value),
+      };
+    })
+    .filter(Boolean) as any[];
+}
 
 // 2. API: Proxy Wikimedia API search
 app.get("/api/wikimedia-search", async (req, res) => {
@@ -1473,16 +1608,38 @@ Ensure all URLs in "sourcesAndLinks" are real, valid links from Wikimedia Common
 For "references", provide ONLY actual existing clinical references. Do NOT fabricate citations.
 Return ONLY valid raw JSON matching this structure. Do not include markdown code backticks.`;
 
-    const response = await callGeminiWithRetry(ai, {
-      model: "gemini-2.5-flash",
-      contents: prompt,
-      config: {
-        responseMimeType: "application/json"
+    const KEY_GROUPS = [
+      ["topic", "diseaseOverview", "keySymptoms", "masterTable", "causeToSymptomFlow", "visualLearningPrompts", "finalSummary"],
+      ["pathophysiologicalAnalysis", "histopathologicalAnalysis", "biochemicalAnalysis"],
+      ["geneticAndMolecularAnalysis", "anatomyPhysiologyCorrelation", "investigationCorrelation"],
+      ["differentialDiagnosisMapping", "therapeuticImplications", "highYieldExamPoints", "visualMindMapStructure", "caseBasedCorrelation"],
+    ];
+    const results = await Promise.allSettled(
+      KEY_GROUPS.map((keys) =>
+        generateJSON(ai, `${prompt}
+
+OUTPUT SCOPE FOR THIS RESPONSE: return a JSON object containing ONLY these top-level keys: ${keys.join(", ")}.
+Use the same 3 to 4 most important symptoms throughout (in this order: ${symptoms || "the cardinal symptoms of the topic"}). Keep every string field to 1-3 precise sentences.`),
+      ),
+    );
+    logChunkFailures("symptom-mechanism-map", results);
+
+    // The overview group anchors the map; without it the result is not coherent enough to show.
+    if (results[0].status !== "fulfilled") throw (results[0] as PromiseRejectedResult).reason;
+
+    const merged: any = { ...fallback };
+    results.forEach((r, i) => {
+      if (r.status !== "fulfilled") return;
+      for (const key of KEY_GROUPS[i]) {
+        const v = (r.value as any)[key];
+        if (v !== undefined && v !== null && !(Array.isArray(v) && v.length === 0)) merged[key] = v;
       }
     });
-
-    const parsed = cleanAndParseJSON(response.text || "");
-    return res.json({ source: "gemini", data: parsed });
+    merged.topic = topic;
+    // Images are never taken from free-text generation (unverified URLs); the Images tab uses the verified pipeline.
+    merged.sourcesAndLinks = fallback.sourcesAndLinks;
+    const liveGroups = results.filter((r) => r.status === "fulfilled").length;
+    return res.json({ source: "gemini", data: merged, notice: liveGroups < KEY_GROUPS.length ? `${KEY_GROUPS.length - liveGroups} section group(s) served from offline data` : undefined });
   } catch (error: any) {
     console.warn("Gemini mapping fallback activated:", error?.message || error);
     return res.json({ source: "fallback-due-to-error", data: fallback });
@@ -1849,23 +2006,19 @@ app.post("/api/generate-cases", async (req, res) => {
       return res.json({ source: "fallback-no-client", data: fallback });
     }
 
-    const systemPrompt = `You are an expert clinical medical educator.
-Generate multiple high-fidelity clinical case scenarios for the medical topic: "${topic}".
-Return structured educational content only.
-
-You MUST generate 10 different cases corresponding to these 10 distinct case types:
-1. Classic presentation
-2. Early/subtle presentation
-3. Severe or emergency presentation
-4. Atypical presentation
-5. Pediatric case
-6. Elderly case
-7. Pregnancy case (if pregnancy is not relevant to this topic, adapt it as a reproductive age female case)
-8. Comorbidity case
-9. Complication case
-10. Differential diagnosis challenge
-
-For each case, include:
+    const CASE_TYPES = [
+      "Classic presentation",
+      "Early/subtle presentation",
+      "Severe or emergency presentation",
+      "Atypical presentation",
+      "Pediatric case",
+      "Elderly case",
+      "Pregnancy case (if pregnancy is not relevant to this topic, adapt it as a reproductive-age female case)",
+      "Comorbidity case",
+      "Complication case",
+      "Differential diagnosis challenge",
+    ];
+    const CASE_FIELDS = `For each case, include:
 - id: a unique short string ID (e.g. "CASE_001")
 - title: clear clinical title (e.g., "Classic Presentation of...")
 - summary: a short high-yield summary of the scenario
@@ -1895,144 +2048,27 @@ For each case, include:
   - answer: string (exactly matches one of the options)
   - explanation: detailed medical explanation of why that option is correct and others are incorrect
 - highYieldPoints: an array of 2-3 high-yield clinical pearls
-- visualLearningPrompts: a description of a visual representation/anatomy layout to assist learning
+- visualLearningPrompts: a description of a visual representation/anatomy layout to assist learning`;
+    const chunks = [0, 2, 4, 6, 8].map((i) => CASE_TYPES.slice(i, i + 2));
 
-Return ONLY valid JSON matching the specified structure, without any markdown formatting wrappers or backticks.`;
+    const results = await Promise.allSettled(
+      chunks.map((types, ci) =>
+        generateJSON(ai, `You are an expert clinical medical educator.
+Generate ${types.length} high-fidelity, medically accurate clinical case scenarios for the medical topic: "${topic}".
+Case types for this batch (one case each, in order):
+${types.map((t, i) => `${ci * 2 + i + 1}. ${t}`).join("\n")}
 
-    const response = await callGeminiWithRetry(ai, {
-      model: "gemini-2.5-flash",
-      contents: systemPrompt,
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.ARRAY,
-          items: {
-            type: Type.OBJECT,
-            properties: {
-              id: { type: Type.STRING },
-              title: { type: Type.STRING },
-              summary: { type: Type.STRING },
-              demographics: { type: Type.STRING },
-              chiefComplaint: { type: Type.STRING },
-              history: { type: Type.STRING },
-              examination: { type: Type.STRING },
-              initialVitals: {
-                type: Type.OBJECT,
-                properties: {
-                  hr: { type: Type.INTEGER },
-                  bp: { type: Type.STRING },
-                  spo2: { type: Type.INTEGER },
-                  temp: { type: Type.NUMBER }
-                },
-                required: ["hr", "bp", "spo2", "temp"]
-              },
-              correctDiagnosis: { type: Type.STRING },
-              correctTreatment: { type: Type.STRING },
-              tests: {
-                type: Type.OBJECT,
-                properties: {
-                  ecg: {
-                    type: Type.OBJECT,
-                    properties: {
-                      name: { type: Type.STRING },
-                      result: { type: Type.STRING },
-                      status: { type: Type.STRING },
-                      details: { type: Type.STRING }
-                    },
-                    required: ["name", "result", "status", "details"]
-                  },
-                  labs: {
-                    type: Type.OBJECT,
-                    properties: {
-                      name: { type: Type.STRING },
-                      result: { type: Type.STRING },
-                      status: { type: Type.STRING },
-                      details: { type: Type.STRING }
-                    },
-                    required: ["name", "result", "status", "details"]
-                  },
-                  cxr: {
-                    type: Type.OBJECT,
-                    properties: {
-                      name: { type: Type.STRING },
-                      result: { type: Type.STRING },
-                      status: { type: Type.STRING },
-                      details: { type: Type.STRING }
-                    },
-                    required: ["name", "result", "status", "details"]
-                  }
-                },
-                required: ["ecg", "labs", "cxr"]
-              },
-              options: {
-                type: Type.ARRAY,
-                items: { type: Type.STRING }
-              },
-              treatments: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    name: { type: Type.STRING },
-                    success: { type: Type.BOOLEAN },
-                    feedback: { type: Type.STRING },
-                    vitals: {
-                      type: Type.OBJECT,
-                      properties: {
-                        hr: { type: Type.INTEGER },
-                        bp: { type: Type.STRING },
-                        spo2: { type: Type.INTEGER },
-                        temp: { type: Type.NUMBER }
-                      },
-                      required: ["hr", "bp", "spo2", "temp"]
-                    }
-                  },
-                  required: ["name", "success", "feedback", "vitals"]
-                }
-              },
-              differentialDiagnosis: {
-                type: Type.ARRAY,
-                items: { type: Type.STRING }
-              },
-              pathophysiologyCorrelation: { type: Type.STRING },
-              managementApproach: { type: Type.STRING },
-              complications: { type: Type.STRING },
-              prognosis: { type: Type.STRING },
-              questions: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    question: { type: Type.STRING },
-                    options: {
-                      type: Type.ARRAY,
-                      items: { type: Type.STRING }
-                    },
-                    answer: { type: Type.STRING },
-                    explanation: { type: Type.STRING }
-                  },
-                  required: ["question", "options", "answer", "explanation"]
-                }
-              },
-              highYieldPoints: {
-                type: Type.ARRAY,
-                items: { type: Type.STRING }
-              },
-              visualLearningPrompts: { type: Type.STRING }
-            },
-            required: [
-              "id", "title", "summary", "demographics", "chiefComplaint",
-              "history", "examination", "initialVitals", "correctDiagnosis",
-              "correctTreatment", "tests", "options", "treatments",
-              "differentialDiagnosis", "pathophysiologyCorrelation",
-              "managementApproach", "complications", "prognosis",
-              "questions", "highYieldPoints", "visualLearningPrompts"
-            ]
-          }
-        }
-      }
-    });
+${CASE_FIELDS}
+Use ids "CASE_${String(ci * 2 + 1).padStart(3, "0")}" and "CASE_${String(ci * 2 + 2).padStart(3, "0")}".
+The tests object must contain the keys "ecg", "labs" and "cxr" (use the most relevant investigation for each even if not literally an ECG or X-ray, and name it accordingly).
+Exactly one treatment has success=true. initialVitals.hr and spo2 are integers, temp is a number, bp is a string like "120/80".
+Be concise: each narrative field at most 3 sentences.
 
+Return ONLY a JSON object of the form {"cases": [ ... ]} with no markdown.`).then((parsed) => extractArray(parsed, ["cases", "data"]) || []),
+      ),
+    );
+    logChunkFailures("generate-cases", results);
+    const response = { text: JSON.stringify(results.flatMap((r) => (r.status === "fulfilled" ? r.value : []))) };
     const cases = (extractArray(cleanAndParseJSON(response.text || ""), ["cases", "data"]) || []).filter(isPlayableCase);
     if (cases.length === 0) throw new Error("AI returned no playable cases");
     // Guarantee unique IDs: React keys and DOM ids are derived from them.
@@ -2422,19 +2458,7 @@ app.post("/api/generate-mindmap", async (req, res) => {
     return res.json({ source: "fallback", data: fallbackMindmap });
   }
   try {
-    const prompt = `You are a world-class, brilliant medical researcher, clinician, pathologist, anatomist, physiologist, and master medical school professor.
-Create a complete, master-level medical mind map of the topic provided: "${cleanTopic}".
-Your mind map must follow the structured prompt schema perfectly, delivering high-fidelity medical content across all 21 required sections.
-
-TOPIC:
-${cleanTopic}
-
-STRUCTURE:
-Strictly follow the exact 21 headings specified below. Your markdown field must include comprehensive, layered, clinically deep medical notes for each of the 21 sections. Do NOT summarize or use placeholders; provide absolute, dense, high-yield clinical value:
-
-# MEDICAL MIND MAP: ${cleanTopic.toUpperCase()}
-
-## 1. Definition
+    const OUTLINE = `## 1. Definition
 ### 1.1 Standard Definition
 ### 1.2 Clinical Definition
 ### 1.3 Key Terminology
@@ -2569,237 +2593,85 @@ Strictly follow the exact 21 headings specified below. Your markdown field must 
 ### 21.7 Special Populations
 ### 21.8 Emerging and Experimental Therapies
 ### 21.9 Evidence Grading and Comparison
-### 21.10 Visual Learning Integration
+### 21.10 Visual Learning Integration`;
+    const sections = OUTLINE.split(/\n(?=## \d+\.)/);
+    const sectionChunks = [[0, 5], [5, 10], [10, 15], [15, 20], [20, 21]].map(([from, to]) => sections.slice(from, to).join("\n\n"));
+    const NODE_IDS = ["def", "anat", "phys", "biochem", "etio", "risk", "pathophys", "path", "clin", "diag", "diff", "mgmt", "pharm", "comp", "prog", "prev", "rsch", "exam", "corr", "summ", "therapeutics"];
+    const PERSONA = `You are a world-class medical researcher, clinician and medical school professor writing a master-level, guideline-concordant study resource on "${cleanTopic}". Be precise and quantitative; never fabricate citations or trial names.`;
 
-In addition to the dense, multi-thousand word detailed markdown string, populate the 'nodes' and 'links' JSON fields which will be used to render an interactive Obsidian Graph View.
-- Provide a central core node (id: "core") representing the main topic.
-- Provide 21 nodes representing each of the 21 main headings (ids: "def", "anat", "phys", "biochem", "etio", "risk", "pathophys", "path", "clin", "diag", "diff", "mgmt", "pharm", "comp", "prog", "prev", "rsch", "exam", "corr", "summ", "therapeutics") with exact human labels ("1. Definition", "2. Anatomy", ..., "21. Latest & Advanced Therapeutics") and an high-yield summary of that section in the 'description' field.
-- Provide links connecting the "core" node to each of the 21 section nodes.
-- CRITICAL: Provide cross-link connections (links) that represent deep medical correlations, such as:
-  * Linking Anatomy ("anat") to Pathophysiology ("pathophys")
-  * Linking Physiology ("phys") to Pathophysiology ("pathophys")
-  * Linking Biochemistry ("biochem") to Diagnosis ("diag") or Pathology ("path")
-  * Linking Pathophysiology ("pathophys") to Clinical Features ("clin")
-  * Linking Clinical Features ("clin") to Diagnosis ("diag")
-  * Linking Diagnosis ("diag") to Differential Diagnosis ("diff")
-  * Linking Diagnosis ("diag") to Management ("mgmt")
-  * Linking Management ("mgmt") to Pharmacology ("pharm")
-  * Linking Pathology ("path") to Complications ("comp")
-  * Linking Management ("mgmt") to Latest & Advanced Therapeutics ("therapeutics")
-  * Linking Pharmacology ("pharm") to Latest & Advanced Therapeutics ("therapeutics")
+    const markdownJobs = sectionChunks.map((chunk) =>
+      generateText(ai, `${PERSONA}
 
-This schema binds anatomical structures to pathophysiological changes, and matches clinical signs to biochemical and diagnostic markers!`;
+Write ONLY the following sections of the mind map for "${cleanTopic}" as Markdown, keeping the exact "## N." and "### N.M" headings below. Under every ### heading write 2-4 dense, specific sentences or bullet points (mechanisms, numbers, named drugs/tests). Output Markdown only, no preamble, no code fences.
 
-    const response = await callGeminiWithRetry(ai, {
-      model: "gemini-2.5-flash",
-      contents: prompt,
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            topic: { type: Type.STRING, description: "The medical topic of the mind map." },
-            markdown: { type: Type.STRING, description: "The complete, detailed markdown document containing all 21 sections, strictly structured." },
-            nodes: {
-              type: Type.ARRAY,
-              description: "High-level interactive graph nodes.",
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  id: { type: Type.STRING, description: "Unique identifier for the node (e.g. core, def, anat)." },
-                  label: { type: Type.STRING, description: "Short readable label for the node." },
-                  category: { 
-                    type: Type.STRING, 
-                    description: "Category of the node (core, definition, anatomy, physiology, biochemistry, etiology, risk_factors, pathophysiology, pathology, clinical_features, diagnosis, differential, management, pharmacology, complications, prognosis, prevention, research, exam, correlation, summary, therapeutics)." 
-                  },
-                  description: { type: Type.STRING, description: "High-yield one-sentence medical summary of this node's content." }
-                },
-                required: ["id", "label", "category", "description"]
-              }
-            },
-            links: {
-              type: Type.ARRAY,
-              description: "Links connecting the nodes to represent correlations.",
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  source: { type: Type.STRING, description: "The ID of the source node." },
-                  target: { type: Type.STRING, description: "The ID of the target node." }
-                },
-                required: ["source", "target"]
-              }
-            },
-            therapeutics: {
-              type: Type.OBJECT,
-              description: "The complete, evidence-based Latest and Advanced Therapeutics module for the topic.",
-              properties: {
-                disclaimer: { type: Type.STRING, description: "Standard clinical disclaimer: 'Educational use only. Not a substitute for professional medical advice, diagnosis, or treatment. Verify with current clinical guidelines and local protocols.'" },
-                lastUpdated: { type: Type.STRING, description: "Year/date checked." },
-                standardTreatment: {
-                  type: Type.ARRAY,
-                  items: { type: Type.STRING },
-                  description: "First-line, second-line, third-line/salvage, supportive, preventive, and emergency care."
-                },
-                latestGuidelines: {
-                  type: Type.ARRAY,
-                  description: "Most recent guideline recommendations.",
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      source: { type: Type.STRING, description: "Guideline source organization (e.g. WHO, NICE, CDC, IDSA, AHA/ACC, ESC, ADA, KDIGO, EULAR, ACR, ASCO, NCCN, GOLD, GINA, AASLD, EASL)." },
-                      year: { type: Type.STRING, description: "Year of guideline publication." },
-                      recommendation: { type: Type.STRING, description: "Key clinical guideline recommendation." },
-                      evidenceLevel: { type: Type.STRING, description: "Strength and level of evidence (e.g. Class I, Level A)." },
-                      clinicalUse: { type: Type.STRING, description: "Key clinical indication or application." }
-                    },
-                    required: ["source", "year", "recommendation"]
-                  }
-                },
-                advancedTherapies: {
-                  type: Type.ARRAY,
-                  description: "Modern targeted therapies, biologics, gene/RNA therapy, immunotherapy, and precision medicine options.",
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      name: { type: Type.STRING, description: "Name of the advanced therapy." },
-                      category: { type: Type.STRING, description: "Category (e.g. Biologics, Monoclonal antibodies, CAR-T, Gene Therapy, siRNA)." },
-                      mechanism: { type: Type.STRING, description: "Detailed molecular mechanism." },
-                      target: { type: Type.STRING, description: "Specific cellular/receptor target." },
-                      indications: { type: Type.STRING, description: "Clinical indications." },
-                      contraindications: { type: Type.STRING, description: "Contraindications." },
-                      benefits: { type: Type.STRING, description: "Therapeutic benefits." },
-                      limitations: { type: Type.STRING, description: "Clinical limitations." },
-                      adverseEffects: { type: Type.STRING, description: "Major adverse effects and toxicities." },
-                      monitoring: { type: Type.STRING, description: "Monitoring requirements." },
-                      evidenceStatus: { type: Type.STRING, description: "Evidence status (e.g., Established, Guideline-supported, recently approved, Investigational, Experimental, Not recommended, Controversial)." },
-                      highYieldPoint: { type: Type.STRING, description: "High-yield pearl for clinical practice or exams." }
-                    },
-                    required: ["name", "category", "mechanism", "target"]
-                  }
-                },
-                emergingTherapies: {
-                  type: Type.ARRAY,
-                  description: "Pipeline molecules, clinical trial agents, and controversial therapies.",
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      name: { type: Type.STRING },
-                      status: { type: Type.STRING, description: "Investigational / Recently approved / Experimental / Controversial" },
-                      mechanism: { type: Type.STRING },
-                      trialPhase: { type: Type.STRING, description: "Current clinical trial phase (e.g., Phase I/II/III)." },
-                      potentialUse: { type: Type.STRING },
-                      limitations: { type: Type.STRING },
-                      safetyConcerns: { type: Type.STRING }
-                    },
-                    required: ["name", "status", "mechanism"]
-                  }
-                },
-                treatmentAlgorithm: {
-                  type: Type.ARRAY,
-                  description: "Stepwise therapeutic pathway steps.",
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      step: { type: Type.STRING, description: "Step number/label (e.g., Step 1: Diagnosis & Triage)." },
-                      decisionPoint: { type: Type.STRING, description: "Clinical trigger or severity class." },
-                      action: { type: Type.STRING, description: "Action to take." },
-                      reason: { type: Type.STRING, description: "Clinical rationale." }
-                    },
-                    required: ["step", "decisionPoint", "action", "reason"]
-                  }
-                },
-                drugComparisonTable: {
-                  type: Type.ARRAY,
-                  description: "Drug classes/agents comparison table.",
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      therapy: { type: Type.STRING, description: "Name of drug/class" },
-                      mechanism: { type: Type.STRING, description: "Mechanism of action" },
-                      indication: { type: Type.STRING, description: "Main indication" },
-                      benefit: { type: Type.STRING, description: "Key clinical benefit" },
-                      limitation: { type: Type.STRING, description: "Clinical limitation" },
-                      adverseEffects: { type: Type.STRING, description: "Major adverse effects" },
-                      monitoring: { type: Type.STRING, description: "Required monitoring" },
-                      evidenceLevel: { type: Type.STRING, description: "Evidence Level (e.g., Strong, Moderate, Limited, Expert opinion, Experimental)" },
-                      highYieldPoint: { type: Type.STRING, description: "High yield exam/clinical point" }
-                    },
-                    required: ["therapy", "mechanism", "indication", "benefit", "limitation", "adverseEffects", "monitoring", "evidenceLevel", "highYieldPoint"]
-                  }
-                },
-                specialPopulations: {
-                  type: Type.ARRAY,
-                  description: "Therapeutic differences for special cohorts (Pediatrics, Elderly, Pregnancy, Lactation, Renal, Liver, Immunocompromised).",
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      population: { type: Type.STRING, description: "Population class name (e.g., Pediatrics, Elderly, Pregnancy)." },
-                      details: { type: Type.STRING, description: "Therapeutic adjustments and key guideline considerations." }
-                    },
-                    required: ["population", "details"]
-                  }
-                },
-                monitoring: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      parameter: { type: Type.STRING, description: "Clinical parameter or laboratory test to monitor." },
-                      frequency: { type: Type.STRING, description: "Frequency of checking." },
-                      rationale: { type: Type.STRING, description: "Detailed clinical rationale." }
-                    },
-                    required: ["parameter", "rationale"]
-                  }
-                },
-                contraindications: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      contraindication: { type: Type.STRING, description: "Contraindication name or clinical trigger." },
-                      rationale: { type: Type.STRING, description: "Detailed pathophysiological rationale." }
-                    },
-                    required: ["contraindication", "rationale"]
-                  }
-                },
-                adverseEffects: {
-                  type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      effect: { type: Type.STRING, description: "Adverse effect." },
-                      management: { type: Type.STRING, description: "Clinical management or mitigation strategy." }
-                    },
-                    required: ["effect", "management"]
-                  }
-                },
-                clinicalPearls: { type: Type.ARRAY, items: { type: Type.STRING }, description: "Expert clinical pearls." },
-                highYieldExamPoints: { type: Type.ARRAY, items: { type: Type.STRING }, description: "High-yield board exam points." },
-                referencesToVerify: { type: Type.ARRAY, items: { type: Type.STRING }, description: "Key clinical trial papers, guideline publications, or databases to cross-check." }
-              },
-              required: [
-                "disclaimer",
-                "lastUpdated",
-                "standardTreatment",
-                "latestGuidelines",
-                "advancedTherapies",
-                "emergingTherapies",
-                "treatmentAlgorithm",
-                "drugComparisonTable",
-                "specialPopulations",
-                "monitoring",
-                "contraindications",
-                "adverseEffects",
-                "clinicalPearls",
-                "highYieldExamPoints",
-                "referencesToVerify"
-              ]
-            }
-          },
-          required: ["topic", "markdown", "nodes", "links", "therapeutics"]
-        }
-      }
+${chunk}`),
+    );
+
+    const graphJob = generateJSON(ai, `${PERSONA}
+
+Return a JSON object {"nodes": [...], "links": [...]} for an interactive knowledge graph of "${cleanTopic}".
+- nodes: one core node {"id":"core","label":"${cleanTopic}","category":"core","description":"..."} plus exactly these 21 section nodes, in order, with ids ${NODE_IDS.map((x) => `"${x}"`).join(", ")}.
+  Labels are "1. Definition", "2. Anatomy", "3. Physiology", "4. Biochemistry", "5. Etiology", "6. Risk Factors", "7. Pathophysiology", "8. Pathology", "9. Clinical Features", "10. Diagnosis", "11. Differentials", "12. Management", "13. Pharmacology", "14. Complications", "15. Prognosis", "16. Prevention", "17. Research", "18. High-Yield Exam", "19. Clinical Corr.", "20. Final Summary", "21. Latest & Advanced Therapeutics".
+  Categories: core, definition, anatomy, physiology, biochemistry, etiology, risk_factors, pathophysiology, pathology, clinical_features, diagnosis, differential, management, pharmacology, complications, prognosis, prevention, research, exam, correlation, summary, therapeutics.
+  Each description is ONE high-yield, topic-specific sentence.
+- links: {"source","target"} from "core" to every section node, plus 8-14 cross-links expressing real causal or diagnostic correlations for this topic (e.g. anat→pathophys, pathophys→clin, clin→diag, diag→mgmt, mgmt→pharm, path→comp, pharm→therapeutics).`);
+
+    const THERAPEUTICS_GROUPS = [
+      `"standardTreatment": string[] (first-line, guideline-directed),
+"latestGuidelines": [{"source","year","recommendation","evidenceLevel","clinicalUse"}],
+"advancedTherapies": [{"name","category","mechanism","target","indications","contraindications","benefits","limitations","adverseEffects","monitoring","evidenceStatus","highYieldPoint"}],
+"emergingTherapies": [{"name","status","mechanism","trialPhase","potentialUse","limitations","safetyConcerns"}]`,
+      `"treatmentAlgorithm": [{"step","decisionPoint","action","reason"}],
+"drugComparisonTable": [{"therapy","mechanism","indication","benefit","limitation","adverseEffects","monitoring","evidenceLevel","highYieldPoint"}],
+"specialPopulations": [{"population","details"}],
+"monitoring": [{"parameter","rationale"}],
+"contraindications": [{"contraindication","rationale"}],
+"adverseEffects": [{"effect","management"}],
+"clinicalPearls": string[],
+"highYieldExamPoints": string[],
+"referencesToVerify": string[] (real guideline/trial names only, flagged for verification)`,
+    ];
+    const therapeuticsJobs = THERAPEUTICS_GROUPS.map((schema) =>
+      generateJSON(ai, `${PERSONA}
+
+Return a JSON object for the "Latest and Advanced Therapeutics" module of "${cleanTopic}" containing ONLY these keys:
+${schema}
+Use 2-5 entries per array and keep each string to 1-2 sentences. If evidence is uncertain, say so explicitly.`),
+    );
+
+    const [graphRes, ...rest] = await Promise.allSettled([graphJob, ...markdownJobs, ...therapeuticsJobs]);
+    const mdRes = rest.slice(0, markdownJobs.length) as PromiseSettledResult<string>[];
+    const thRes = rest.slice(markdownJobs.length) as PromiseSettledResult<any>[];
+    logChunkFailures("generate-mindmap", [graphRes, ...rest]);
+
+    // Graph is the core of this view; without it, fall back entirely.
+    if (graphRes.status !== "fulfilled") throw (graphRes as PromiseRejectedResult).reason;
+
+    const fallbackSections: string[] = String(fallbackMindmap.markdown || "").split(/\n(?=## \d+\.)/);
+    const markdownParts = mdRes.map((r, i) => {
+      if (r.status === "fulfilled") return r.value;
+      const [from, to] = [[1, 6], [6, 11], [11, 16], [16, 21], [21, 22]][i];
+      return fallbackSections.slice(from, to).join("\n\n"); // index 0 of the fallback is the "# title" block
     });
+
+    const therapeutics: any = {
+      disclaimer: "Educational use only. Not a substitute for professional medical advice, diagnosis, or treatment. Verify with current clinical guidelines and local protocols.",
+      lastUpdated: String(new Date().getFullYear()),
+    };
+    thRes.forEach((r) => {
+      if (r.status === "fulfilled") Object.assign(therapeutics, r.value);
+    });
+    if (thRes.every((r) => r.status !== "fulfilled") && fallbackMindmap.therapeutics) Object.assign(therapeutics, fallbackMindmap.therapeutics);
+
+    const response = {
+      text: JSON.stringify({
+        topic: cleanTopic,
+        markdown: `# MEDICAL MIND MAP: ${cleanTopic.toUpperCase()}\n\n${markdownParts.filter(Boolean).join("\n\n")}`,
+        nodes: graphRes.value.nodes,
+        links: graphRes.value.links,
+        therapeutics,
+      }),
+    };
 
     const parsed = cleanAndParseJSON(response.text || "{}");
     if (!parsed || !Array.isArray(parsed.nodes) || parsed.nodes.length === 0) {

@@ -64,6 +64,25 @@ Important:
 - Rotate keys if they were exposed.
 - Use secrets manager in cloud production.
 
+### 5.1 Provider notes: aicredits.in (measured)
+Measured against the live gateway:
+- **~30 s hard cap per request** (the gateway returns HTTP 500 after that). Large documents are therefore generated as parallel chunks: cases in 5×2, the symptom map in 4 key groups, and the mind map as graph + 5 markdown chunks + 2 therapeutics chunks. Chunks are merged, and any failed chunk is filled from offline data.
+- **5 concurrent requests per key** (HTTP 429 "Concurrency Limit Exceeded" above that). `AI_MAX_CONCURRENCY=4` queues calls in-process; a 429 backs off and retries the same model.
+- **Model choice:** `google/gemini-3.5-flash-lite` (~320 tok/s) completed every chunk inside the cap. `gemini-3.5-flash` timed out on most large chunks; `openai/gpt-4.1-mini` works but runs about 2× slower.
+
+```env
+GEMINI_BASE_URL=https://aicredits.in/v1
+GEMINI_MODEL=google/gemini-3.5-flash-lite
+AI_FALLBACK_MODELS=openai/gpt-4.1-mini,gpt-4o-mini
+AI_MAX_CONCURRENCY=4
+```
+
+Typical live latency: single answers 3–12 s; 10 cases ~20 s; full mind map ~20 s; symptom map ~8 s. Repeat requests are served from the response cache.
+
+**Outbound proxies:** Node's `fetch` ignores `HTTPS_PROXY`. The server detects `HTTPS_PROXY`/`HTTP_PROXY` and routes through it automatically.
+
+**Images:** the atlas searches Wikimedia Commons for real files, has the AI pick and annotate relevant ones, then scores them. The host must reach `commons.wikimedia.org` and `upload.wikimedia.org`. Wikimedia throttles shared egress IPs; on HTTP 429 the server honours `Retry-After` and serves curated images meanwhile.
+
 ## 6) Local Production Build and Run
 ### Step 1: Install dependencies
 ```powershell

@@ -7,6 +7,8 @@ interface Props {
   onStatusChange: (simulated: boolean) => void;
   activeTopic: string;
   setActiveTopic: (topic: string) => void;
+  /** Incremented by the app when a new topic is applied. */
+  topicVersion?: number;
 }
 
 type SectionKey =
@@ -109,7 +111,7 @@ const ImageCard: React.FC<{ img: MedicalImage & { verificationScore?: number } }
   );
 };
 
-export default function SymptomMapper({ onStatusChange, activeTopic }: Props) {
+export default function SymptomMapper({ onStatusChange, activeTopic, topicVersion = 0 }: Props) {
   const [symptoms, setSymptoms] = useState<string[]>(['Chest pain', 'Dyspnoea']);
   const [symptomInput, setSymptomInput] = useState('');
   const [caseDetails, setCaseDetails] = useState('');
@@ -161,6 +163,16 @@ export default function SymptomMapper({ onStatusChange, activeTopic }: Props) {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // A newly applied topic rebuilds the map; symptoms reset so the model picks that topic's cardinal features.
+  useEffect(() => {
+    if (topicVersion === 0) return;
+    setSymptoms([]);
+    setImagesTopic('');
+    setImages(null);
+    generate(activeTopic, [], '');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [topicVersion]);
 
   // Images load lazily, only when the tab is opened (each one costs several live URL checks).
   useEffect(() => {

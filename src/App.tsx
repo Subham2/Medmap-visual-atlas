@@ -119,6 +119,8 @@ export default function App() {
 
   // Dynamic Case Generation State
   const [activeTopic, setActiveTopic] = useState<string>('Myocardial Infarction');
+  // Bumped whenever a topic is explicitly applied, so the symptom mapper rebuilds for it.
+  const [topicVersion, setTopicVersion] = useState(0);
   const [generationTopic, setGenerationTopic] = useState('Myocardial Infarction');
   const [isGeneratingCases, setIsGeneratingCases] = useState(false);
   const [caseGenerationError, setCaseGenerationError] = useState<string | null>(null);
@@ -210,6 +212,7 @@ export default function App() {
         if (payload && Array.isArray(payload.data) && payload.data.length > 0) {
           setCases(payload.data);
           setActiveTopic(topic);
+          setTopicVersion((v) => v + 1);
           setIsApiSimulated(payload.source !== 'gemini');
           // Stay on the catalogue so the learner can pick a case (auto-opening hid the success banner).
           setActiveCase(null);
@@ -607,6 +610,7 @@ export default function App() {
               onStatusChange={(simulated) => setIsApiSimulated(simulated)} 
               activeTopic={activeTopic}
               setActiveTopic={setActiveTopic}
+              topicVersion={topicVersion}
             />
           </div>
         </section>
